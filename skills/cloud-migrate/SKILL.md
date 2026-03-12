@@ -26,15 +26,19 @@ if [ -f "$CONFIG" ]; then
   echo "=== 已保存的平台配置 ==="
   cat "$CONFIG"
   echo ""
-  # 检测是否多模块
   python3 -c "
 import json
 d = json.load(open('$CONFIG'))
 modules = d.get('modules', {})
+defaults = d.get('defaults', {})
+if defaults:
+    print('全局默认:')
+    for k, v in defaults.items(): print(f'  {k}: {v}')
 if modules:
     print(f'模式: 多模块 ({len(modules)} 个子模块)')
     for name, m in modules.items():
-        print(f'  {name}: {m.get(\"app_name\", \"(未设置)\")} [{m.get(\"type\", \"auto\")}]')
+        sym3t = m.get('sym3_test_url', defaults.get('sym3_test_url', '(继承默认)'))
+        print(f'  {name}: app={m.get(\"app_name\",\"?\")} type={m.get(\"type\",\"auto\")} sym3_test={sym3t}')
 else:
     print(f'模式: 单模块 → {d.get(\"app_name\", \"(未设置)\")}')
 " 2>/dev/null
@@ -46,37 +50,38 @@ fi
 
 如果输出 `CONFIG_NOT_FOUND`，**必须向用户询问**以下信息（逐项确认，不能跳过）：
 
-**第一步：平台地址（所有子模块共享）**
-1. **sym3 测试环境地址** — 例如 `https://sym3-test.example.com`
-2. **sym3 线上环境地址** — 例如 `https://sym3.example.com`
-3. **Sentry 平台地址** — 例如 `https://sentry.example.com`
+**第一步：判断是否多模块**
+检查 pom.xml 中是否有 `<module>`、是否存在多个 Dockerfile，据此判断单/多模块。
 
-**第二步：判断是否多模块**
-检查 Step 0.5 的项目类型识别结果。如果 pom.xml 中有 `<module>`，或者存在多个 Dockerfile，则提示用户确认各子模块信息。
+**第二步：收集平台地址和应用信息**
 
-- **单模块项目**：只需要一个 `app_name`
-- **多模块项目**：需要为每个子模块分别配置 `app_name` 和类型
+- **单模块项目**：收集该项目的 sym3 测试/线上地址、Sentry 地址、应用名
+- **多模块项目**：逐个子模块收集。先问用户"这些模块是否在同一套 sym3 集群和 Sentry 上？"
+  - 如果**相同**：只问一次地址，存入 `defaults`，各模块只需填 `app_name`
+  - 如果**不同**：每个模块单独填写全部地址
 
 用户回答后，根据情况生成对应格式的配置文件。
 
 **单模块格式：**
 ```json
 {
+  "app_name": "urs-mail",
   "sym3_test_url": "https://sym3-test.example.com",
   "sym3_prod_url": "https://sym3.example.com",
   "sentry_url": "https://sentry.example.com",
-  "app_name": "urs-mail",
   "created_at": "2026-03-13T10:00:00",
   "updated_at": "2026-03-13T10:00:00"
 }
 ```
 
-**多模块格式：**
+**多模块格式（全局默认 + 按模块覆盖）：**
 ```json
 {
-  "sym3_test_url": "https://sym3-test.example.com",
-  "sym3_prod_url": "https://sym3.example.com",
-  "sentry_url": "https://sentry.example.com",
+  "defaults": {
+    "sym3_test_url": "https://sym3-test.example.com",
+    "sym3_prod_url": "https://sym3.example.com",
+    "sentry_url": "https://sentry.example.com"
+  },
   "modules": {
     "urs-web": {
       "path": "urs-web",
@@ -86,12 +91,17 @@ fi
     "urs-dubbo-service": {
       "path": "urs-dubbo-service",
       "app_name": "urs-dubbo-service",
-      "type": "dubbo-jar"
+      "type": "dubbo-jar",
+      "sym3_test_url": "https://sym3-test-cluster2.example.com",
+      "sym3_prod_url": "https://sym3-cluster2.example.com"
     },
     "urs-admin": {
       "path": "urs-admin-frontend",
       "app_name": "urs-admin",
-      "type": "frontend"
+      "type": "frontend",
+      "sym3_test_url": "https://sym3-test-fe.example.com",
+      "sym3_prod_url": "https://sym3-fe.example.com",
+      "sentry_url": "https://sentry-fe.example.com"
     }
   },
   "created_at": "2026-03-13T10:00:00",
@@ -99,11 +109,25 @@ fi
 }
 ```
 
+**地址解析规则（核心）：** 读取某个模块的平台地址时，**模块级字段优先，缺省则回退到 `defaults`**。解析逻辑：
+
+```python
+def resolve(module_conf, defaults, key):
+    return module_conf.get(key) or defaults.get(key)
+```
+
+例如上面的配置中：
+- `urs-web` 没有自己的地址 → 使用 `defaults` 中的地址
+- `urs-dubbo-service` 覆盖了 sym3 地址（不同集群）但没覆盖 sentry → sentry 用 `defaults`
+- `urs-admin` 全部覆盖（前端用不同的 sym3 和 Sentry 实例）
+
 **多模块格式字段说明：**
-- `modules` 的 key 是模块标识（用于报告显示）
-- `path` 是子模块相对于仓库根目录的路径（包含 Dockerfile 或 pom.xml 的目录）
-- `app_name` 是该模块在 sym3 平台上的应用名（每个模块独立的镜像名/服务名）
-- `type` 可以由用户指定，也可以设为 `"auto"` 让 Step 0.5 自动检测
+- `defaults` — 全局默认平台地址，所有未单独指定地址的模块共用（可选，如果每个模块地址都不同则可省略）
+- `modules` 的 key — 模块标识（用于报告显示）
+- `path` — 子模块相对于仓库根目录的路径
+- `app_name` — 该模块在 sym3 平台上的应用名
+- `type` — 可由用户指定或设为 `"auto"` 自动检测
+- `sym3_test_url` / `sym3_prod_url` / `sentry_url` — 模块级覆盖（可选）
 
 写入配置后确保加入 `.gitignore`：
 ```bash
@@ -117,7 +141,7 @@ fi
 
 配置加载后进入项目识别。
 
-**多模块项目的后续流程：** Step 1-4 的每一步都会**遍历 modules 中的每个子模块**，以子模块的 `path` 为工作目录分别执行检查。Step 3.5 的平台验证也会对每个子模块的 `app_name` 分别访问 sym3 平台。最终报告按子模块分组展示。
+**多模块项目的后续流程：** Step 1-4 的每一步都会**遍历 modules 中的每个子模块**，以子模块的 `path` 为工作目录分别执行检查。Step 3.5 的平台验证会为每个子模块**解析其实际生效的平台地址**后分别访问。最终报告按子模块分组展示。
 
 ---
 
@@ -482,22 +506,32 @@ CONFIG="$P/.cloud-migrate.json"
 python3 -c "
 import json
 d = json.load(open('$CONFIG'))
-print(f'sym3_test: {d[\"sym3_test_url\"]}')
-print(f'sym3_prod: {d[\"sym3_prod_url\"]}')
-print(f'sentry: {d[\"sentry_url\"]}')
-
+defaults = d.get('defaults', {})
 modules = d.get('modules', {})
+
+def resolve(mod, key):
+    return mod.get(key) or defaults.get(key) or d.get(key) or '(未配置)'
+
 if modules:
     print(f'mode: multi-module ({len(modules)})')
     for key, m in modules.items():
-        print(f'  module: {key} | app_name: {m[\"app_name\"]} | path: {m.get(\"path\", key)} | type: {m.get(\"type\", \"auto\")}')
+        print(f'  module: {key}')
+        print(f'    app_name:   {m[\"app_name\"]}')
+        print(f'    path:       {m.get(\"path\", key)}')
+        print(f'    type:       {m.get(\"type\", \"auto\")}')
+        print(f'    sym3_test:  {resolve(m, \"sym3_test_url\")}')
+        print(f'    sym3_prod:  {resolve(m, \"sym3_prod_url\")}')
+        print(f'    sentry:     {resolve(m, \"sentry_url\")}')
 else:
-    print(f'mode: single-module')
-    print(f'  app_name: {d[\"app_name\"]}')
+    print('mode: single-module')
+    print(f'  app_name:   {d.get(\"app_name\", \"(未设置)\")}')
+    print(f'  sym3_test:  {d.get(\"sym3_test_url\", \"(未配置)\")}')
+    print(f'  sym3_prod:  {d.get(\"sym3_prod_url\", \"(未配置)\")}')
+    print(f'  sentry:     {d.get(\"sentry_url\", \"(未配置)\")}')
 " 2>/dev/null
 ```
 
-**多模块项目：** 对 `modules` 中的每个子模块依次执行下面的 3.5.1 和 3.5.2 流程。每个模块用自己的 `app_name` 访问平台。将所有模块的抓取结果汇总后传入 Agent E。
+**多模块项目：** 对 `modules` 中的每个子模块依次执行下面的 3.5.1 和 3.5.2 流程。每个模块使用**解析后的实际地址**（模块级覆盖 > defaults > 顶层）访问对应的平台。将所有模块的抓取结果汇总后传入 Agent E。
 
 ### 3.5.1 sym3 平台配置验证
 
@@ -685,10 +719,12 @@ Prompt:
 - 更新后写回文件，更新 `updated_at` 字段
 
 **多模块管理操作：**
-- "添加模块" — 向 `modules` 中新增一个子模块条目
+- "添加模块" — 向 `modules` 中新增一个子模块条目（会询问是否使用 defaults 地址还是单独指定）
 - "删除模块 xxx" — 从 `modules` 中移除指定模块
+- "修改模块 xxx 的地址" — 更新指定模块的平台地址覆盖（或改回使用 defaults）
 - "修改模块 xxx 的应用名" — 更新指定模块的 `app_name`
-- "转为多模块" — 将单模块配置升级为多模块格式（保留平台地址，将原 `app_name` 作为第一个模块）
+- "修改默认地址" — 更新 `defaults` 中的全局默认平台地址
+- "转为多模块" — 将单模块配置升级为多模块格式
 
 **单模块转多模块的转换逻辑：**
 ```bash
@@ -700,6 +736,10 @@ with open('$CONFIG', 'r') as f:
     d = json.load(f)
 if 'modules' not in d:
     old_name = d.pop('app_name', 'default')
+    d['defaults'] = {}
+    for key in ['sym3_test_url', 'sym3_prod_url', 'sentry_url']:
+        if key in d:
+            d['defaults'][key] = d.pop(key)
     d['modules'] = {
         old_name: {
             'path': '.',
@@ -710,7 +750,7 @@ if 'modules' not in d:
     d['updated_at'] = datetime.datetime.now().isoformat()
     with open('$CONFIG', 'w') as f:
         json.dump(d, f, indent=2, ensure_ascii=False)
-    print(f'已转为多模块格式，原应用名 {old_name} 作为第一个模块')
+    print(f'已转为多模块格式，原地址移入 defaults，原应用名 {old_name} 作为第一个模块')
 else:
     print('已经是多模块格式')
 "
